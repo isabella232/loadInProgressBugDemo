@@ -1,111 +1,68 @@
 import Apollo
 import ApolloPagination
-import Combine
 import RocketReserverAPI
 import SwiftUI
 
-class LaunchListViewModel: ObservableObject {
-    @Published var launches: [LaunchListQuery.Data.Launches.Launch]
+private let pageSize = 10
 
-    @Published var isLoading: Bool = false
-    @Published var hasMore: Bool = true
+extension LaunchListQuery.Data.Launches.Launch: Identifiable { }
 
-    @Published var errorString: String = ""
-
-    private var cancellable: AnyCancellable?
-    private let pageSize = 10
-    private var pager: GraphQLQueryPager<PaginationOutput<LaunchListQuery, LaunchListQuery>>?
+@Observable final class LaunchListViewModel: ObservableObject {
+    var showTailSpinner = false
+    var canLoadNext: Bool { pager.canLoadNext }
+    var launches: [LaunchListQuery.Data.Launches.Launch] = []
+    var error: Error?
+    var showError: Bool {
+        get { error != nil }
+        set { error = nil }
+    }
+    private var pager: GraphQLQueryPager<[LaunchListQuery.Data.Launches.Launch]>
 
     init() {
-        launches = []
-        setUpPaginaiton()
-    }
-
-    // MARK: - Launch Loading
-
-    private func setUpPaginaiton() {
-        let initialQueury = LaunchListQuery(
-            pageSize: .some(pageSize),
-            cursor: .none
-        )
-        pager = GraphQLQueryPager(
+        let initialQuery = LaunchListQuery(pageSize: .some(pageSize), cursor: .none)
+        self.pager = GraphQLQueryPager(
             client: Network.shared.apollo,
-            initialQuery: initialQueury,
-            extractPageInfo: { [weak self] data in
-                DispatchQueue.main.async {
-                    self?.hasMore = data.launches.hasMore
-                }
-                print("cursor: data.launches: \(data.launches.launches.compactMap { $0?.mission?.name })")
-                return CursorBasedPagination.Forward(hasNext: data.launches.hasMore, endCursor: data.launches.cursor)
+            initialQuery: initialQuery,
+            extractPageInfo: { data in
+                CursorBasedPagination.Forward(hasNext: data.launches.hasMore, endCursor: data.launches.cursor)
             },
-            pageResolver: { [weak self] page, paginationDirection in
-                guard let self else {
-                    return nil
-                }
-
-                print("cursor: page.endCursor: \(page.endCursor)")
-
-                switch paginationDirection {
-                case .next:
-                    return LaunchListQuery(pageSize: .some(self.pageSize), cursor: page.endCursor ?? .none)
-                case .previous:
-                    return nil
-                }
+            pageResolver: { page, direction in
+                LaunchListQuery(pageSize: .some(pageSize), cursor: page.endCursor ?? .none)
+            },
+            transform: { data in
+                data.launches.launches.compactMap { $0 }
             }
         )
-
-        cancellable = pager?.receive(on: DispatchQueue.main).sink { result in
-            self.isLoading = false
-
+        pager.subscribe { result in
             switch result {
-            case let .success(data):
-                let (output, source) = data
-                let initial = output.initialPage.launches.launches.compactMap { $0 }
-                let next = output.nextPages.map { page in
-                    page.launches.launches.compactMap { $0 }
-                }.flatMap { $0 }
-
-                print("data source is: \(source)")
-                self.launches = initial + next
-
-            case let .failure(error):
-                print("skipping error: \(error)")
+            case .success((let launches, _)):
+                self.launches = launches
+            case .failure(let error):
+                // These are network errors, and worth showing to the user.
+                self.error = error
             }
         }
+
+        fetch()
     }
 
-    func reset() async {
-        await MainActor.run {
-            launches = []
-            isLoading = false
-            hasMore = true
-        }
-        await loadMoreLaunchesIfTheyExist()
+    func refresh() {
+        pager.refetch()
     }
 
-    func loadMoreLaunchesIfTheyExist() async {
-        guard !isLoading, hasMore else {
-            return
-        }
-        await MainActor.run {
-            isLoading = true
-        }
-
-        if launches.isEmpty {
-            pager?.fetch()
-        } else {
-            pager?.loadNext(completion: { [weak self] (error: PaginationError?) in
-                guard let self else {
-                    return
-                }
-                if let error {
-                    errorString = error.localizedDescription
-                }
-            })
-        }
+    func fetch() {
+        pager.fetch()
     }
 
-    deinit {
-        cancellable = nil
+    func loadNextPage() {
+        guard canLoadNext, !showTailSpinner else { return }
+        self.showTailSpinner = true
+        pager.loadNext() { error in
+            self.showTailSpinner = false
+            // This is a usage error
+            if let error {
+                assertionFailure(error.localizedDescription)
+            }
+        }
     }
 }
